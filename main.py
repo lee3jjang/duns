@@ -148,7 +148,8 @@ def send_message_to_chat(chat_id: int, message: str) -> None:
 async def main() -> None:
     product_df = await fetch_all_product_data(MENU_LINKS)
     product_ids = get_product_ids_from_supabase()
-    new_product_df = product_df.loc[lambda x: ~x["id"].isin(product_ids)]
+    # new_product_df = product_df.loc[lambda x: ~x["id"].isin(product_ids)]
+    new_product_df = product_df.head(3)  # For testing, limit to first 3 products
 
     if not new_product_df.empty:
         print(f"Inserting {len(new_product_df)} new products into Supabase.")
