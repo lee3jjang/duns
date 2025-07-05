@@ -8,6 +8,9 @@ import asyncio
 import pandas as pd
 from bs4 import BeautifulSoup
 from supabase import create_client
+from dotenv import load_dotenv
+
+load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -153,10 +156,14 @@ async def main() -> None:
 
     if not new_product_df.empty:
         print(f"Inserting {len(new_product_df)} new products into Supabase.")
-        insert_data_to_supabase(new_product_df)
+        # insert_data_to_supabase(new_product_df)
         message = generate_telegram_message(new_product_df)
         chat_ids = get_chat_ids_from_supabase()
         for chat_id in chat_ids:
             send_message_to_chat(chat_id, message)
     else:
         print("No new products to insert into Supabase.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
