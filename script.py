@@ -52,7 +52,6 @@ async def fetch_product_data(
     client: httpx.AsyncClient,
     href: str,
 ) -> pd.DataFrame:
-    """Fetch product data from a given page URL."""
     url = urljoin(BASE_URL, href)
     response = await client.get(url)
     soup = BeautifulSoup(response.text, "html.parser")
@@ -71,34 +70,79 @@ async def fetch_product_data(
     return df
 
 
-async def fetch_all_product_data(menu_links: list[dict]) -> pd.DataFrame:
+async def fetch_all_product_data(
+    menu_links: list[dict],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     async with httpx.AsyncClient() as client:
         tasks = [fetch_product_data(client, item["href"]) for item in menu_links]
         results = await asyncio.gather(*tasks)
-        raw_product_df = pd.concat(results, ignore_index=True)
-        product_df = (
-            raw_product_df.astype(
-                {"variants": "str", "options_with_values": "str", "images": "str"}
-            )
-            .drop_duplicates()
-            .reset_index(drop=True)
+
+    raw_product_df = pd.concat(results, ignore_index=True)
+
+    PRODUCT_COLUMNS = ["id", "title", "handle", "url"]
+    product_df = (
+        raw_product_df[PRODUCT_COLUMNS].drop_duplicates().reset_index(drop=True)
+    )
+    product_df_exploded = raw_product_df.rename(columns={"id": "product_id"}).explode(
+        "variants"
+    )
+    product_variant_product_id_df = (
+        pd.json_normalize(product_df_exploded["variants"])[["id"]]
+        .set_index(product_df_exploded["product_id"])
+        .drop_duplicates()
+        .reset_index()
+    )
+
+    PRODUCT_VARIANT_COLUMNS = ["id", "title", "name", "available"]
+    product_variant_df = (
+        pd.DataFrame.from_records(raw_product_df["variants"].sum())[
+            PRODUCT_VARIANT_COLUMNS
+        ]
+        .drop_duplicates()
+        .merge(
+            product_variant_product_id_df,
+            on="id",
+            how="left",
         )
-        return product_df
+    )
+
+    return (product_df, product_variant_df)
 
 
-def insert_data_to_supabase(product_df: pd.DataFrame) -> None:
+def insert_product_to_supabase(product_df: pd.DataFrame) -> None:
     if product_df.empty:
         print("No product data to insert.")
         return
 
     data = product_df.to_dict(orient="records")
-    supabase.table(table_name=TABLE_NAME).insert(data).execute()
+    supabase.table(table_name="products").insert(data).execute()
 
 
 def get_product_ids_from_supabase() -> list[int]:
-    response = supabase.table(table_name=TABLE_NAME).select("id").execute()
+    response = supabase.table(table_name="products").select("id").execute()
     df = pd.DataFrame.from_records(response.data)
     return df["id"].tolist()
+
+
+def get_available_product_variant_ids_from_supabase() -> list[int]:
+    response = (
+        supabase.table(table_name="product_variants")
+        .select("id")
+        .eq("available", True)
+        .execute()
+    )
+    df = pd.DataFrame.from_records(response.data)
+    return df["id"].tolist()
+
+
+def update_product_variant_to_supabase(product_variant_df: pd.DataFrame) -> None:
+    if product_variant_df.empty:
+        print("No product variant data to insert.")
+        return
+
+    data = product_variant_df.to_dict(orient="records")
+    supabase.table(table_name="product_variants").delete().neq("id", 99999999).execute()
+    supabase.table(table_name="product_variants").insert(data).execute()
 
 
 def get_chat_ids_from_supabase() -> list[int]:
@@ -114,33 +158,6 @@ def get_bot_updates() -> dict:
     return res.json()
 
 
-def generate_telegram_message(product_df: pd.DataFrame) -> str:
-    message_lines = ["🆕 [신상 입고 알림]\n"]
-
-    for idx, row in product_df.iterrows():
-        title = row["title"]
-        url = f"https://shopdunssweden.se{row['url']}"
-
-        try:
-            options_raw = ast.literal_eval(row["options_with_values"])
-        except Exception as e:
-            print(f"[Error parsing options] {row['title']}: {e}")
-            options_raw = []
-
-        options = []
-        for opt in options_raw:
-            values = opt.get("values", [])
-            options.extend(values)
-        options_str = ", ".join(opt.strip() for opt in options)
-
-        msg = f"""**{title}**
-옵션: {options_str}  
-🔗 [상품보기]({url})\n"""
-        message_lines.append(f"{idx + 1}. {msg}")
-
-    return "\n".join(message_lines)
-
-
 def send_message_to_chat(chat_id: int, message: str) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
@@ -148,21 +165,65 @@ def send_message_to_chat(chat_id: int, message: str) -> None:
         client.post(url, data=payload)
 
 
+def generate_new_product_alert_message(new_product_df: pd.DataFrame) -> str:
+    message_lines: list[str] = ["🆕 [신상 입고 알림]\n"]
+
+    for idx, row in new_product_df.iterrows():
+        title = row["title"]
+        url = f"https://shopdunssweden.se{row['url']}"
+
+        msg = f"""**{title}**
+🔗 [상품보기]({url})\n"""
+        message_lines.append(f"{idx + 1}. {msg}")
+
+    return "\n".join(message_lines)
+
+
+def generate_restock_alert_message(
+    new_available_product_variant_df: pd.DataFrame,
+) -> str:
+    message_lines = ["🔔 *[재고 알림]*\n"]
+
+    for idx, row in new_available_product_variant_df.iterrows():
+        name = row.get("name", "").strip()
+        url = f"https://shopdunssweden.se{row['url'].strip()}"
+
+        msg = f"""*{name}*\n🔗 [상품보기]({url})\n"""
+        message_lines.append(f"{idx + 1}. {msg}")
+
+    return "\n".join(message_lines)
+
+
 async def main() -> None:
-    product_df = await fetch_all_product_data(MENU_LINKS)
+    product_df, product_variant_df = await fetch_all_product_data(MENU_LINKS)
+    chat_ids = get_chat_ids_from_supabase()
     product_ids = get_product_ids_from_supabase()
     new_product_df = product_df.loc[lambda x: ~x["id"].isin(product_ids)]
-    # new_product_df = product_df.head(3)  # For testing, limit to first 3 products
-
     if not new_product_df.empty:
-        print(f"Inserting {len(new_product_df)} new products into Supabase.")
-        insert_data_to_supabase(new_product_df)
-        message = generate_telegram_message(new_product_df)
-        chat_ids = get_chat_ids_from_supabase()
+        # message = generate_new_product_alert_message(new_product_df)
+        # for chat_id in chat_ids:
+        #     send_message_to_chat(chat_id, message)
+        insert_product_to_supabase(new_product_df)
+
+    available_product_variant_ids = get_available_product_variant_ids_from_supabase()
+    new_available_product_variant_df = product_variant_df.query("available").loc[
+        lambda x: ~x["id"].isin(available_product_variant_ids)
+    ]
+
+    if not new_available_product_variant_df.empty:
+        new_available_product_variant_df_with_product_info = (
+            new_available_product_variant_df.merge(
+                product_df.drop(columns=["title"]).rename(columns={"id": "product_id"}),
+                on="product_id",
+                how="left",
+            )
+        )
+        message = generate_restock_alert_message(
+            new_available_product_variant_df_with_product_info
+        )
         for chat_id in chat_ids:
             send_message_to_chat(chat_id, message)
-    else:
-        print("No new products to insert into Supabase.")
+        update_product_variant_to_supabase(product_variant_df)
 
 
 if __name__ == "__main__":
